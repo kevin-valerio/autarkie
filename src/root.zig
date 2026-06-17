@@ -60,6 +60,26 @@ pub const CodecError = error{
     TrailingBytes,
 };
 
+pub const Mutation = union(enum) {
+    generate_replace,
+    recursive_replace,
+    splice: []const u8,
+    generate_append,
+    splice_append: []const u8,
+    iterable_pop: usize,
+};
+
+pub const MutationError = error{
+    OutOfMemory,
+    RecursionLimit,
+    UnexpectedEnd,
+    InvalidTag,
+    TrailingBytes,
+    InvalidPath,
+    ImmutableField,
+    UnsupportedMutation,
+};
+
 pub const Visitor = struct {
     allocator: std.mem.Allocator,
     depth: DepthInfo,
@@ -215,6 +235,16 @@ pub const Visitor = struct {
     }
 };
 
+pub fn deinitFieldPaths(
+    allocator: std.mem.Allocator,
+    paths: *std.ArrayList(std.ArrayList(FieldLocation)),
+) void {
+    for (paths.items) |*path| {
+        path.deinit(allocator);
+    }
+    paths.deinit(allocator);
+}
+
 pub fn typeId(comptime T: type) Id {
     return std.hash.Wyhash.hash(0, @typeName(T));
 }
@@ -274,6 +304,72 @@ pub fn maybeDeserializeAlloc(
         return null;
     }
     return value;
+}
+
+pub fn collectFields(comptime T: type, visitor: *Visitor, value: *const T) !void {
+    try collectFieldsAt(T, visitor, value);
+}
+
+pub fn mutateAtPath(
+    comptime T: type,
+    visitor: *Visitor,
+    value: *T,
+    path: []const usize,
+    mutation: Mutation,
+) MutationError!void {
+    if (path.len == 0) {
+        return mutateHere(T, visitor, value, mutation);
+    }
+
+    switch (@typeInfo(T)) {
+        .pointer => |pointer| switch (pointer.size) {
+            .one => return mutateAtPath(pointer.child, visitor, value.*, path, mutation),
+            .slice => {
+                if (pointer.is_const) return error.ImmutableField;
+                const index = path[0];
+                if (index >= value.*.len) return error.InvalidPath;
+                return mutateAtPath(pointer.child, visitor, &value.*[index], path[1..], mutation);
+            },
+            else => return error.InvalidPath,
+        },
+        .array => |array| {
+            const index = path[0];
+            if (index >= array.len) return error.InvalidPath;
+            return mutateAtPath(array.child, visitor, &value[index], path[1..], mutation);
+        },
+        .optional => |optional| {
+            if (path[0] != 0) return error.InvalidPath;
+            if (value.*) |*payload| {
+                return mutateAtPath(optional.child, visitor, payload, path[1..], mutation);
+            }
+            return error.InvalidPath;
+        },
+        .@"struct" => |info| {
+            inline for (info.fields, 0..) |field, i| {
+                if (path[0] == i) {
+                    if (field.is_comptime) return error.ImmutableField;
+                    return mutateAtPath(field.type, visitor, &@field(value, field.name), path[1..], mutation);
+                }
+            }
+            return error.InvalidPath;
+        },
+        .@"union" => |info| {
+            if (info.tag_type == null) return error.InvalidPath;
+            switch (value.*) {
+                inline else => |*payload, tag| {
+                    inline for (info.fields, 0..) |field, i| {
+                        if (comptime std.mem.eql(u8, field.name, @tagName(tag))) {
+                            if (path[0] != i) return error.InvalidPath;
+                            if (field.type == void) return error.InvalidPath;
+                            return mutateAtPath(field.type, visitor, payload, path[1..], mutation);
+                        }
+                    }
+                    unreachable;
+                },
+            }
+        },
+        else => return error.InvalidPath,
+    }
 }
 
 pub fn deinitGenerated(comptime T: type, allocator: std.mem.Allocator, value: *T) void {
@@ -585,6 +681,223 @@ fn appendUnion(
             unreachable;
         },
     }
+}
+
+fn collectFieldsAt(comptime T: type, visitor: *Visitor, value: *const T) !void {
+    switch (@typeInfo(T)) {
+        .pointer => |pointer| switch (pointer.size) {
+            .one => try collectFieldsAt(pointer.child, visitor, value.*),
+            .slice => {
+                for (value.*, 0..) |*item, i| {
+                    try visitor.registerFieldStack(.{
+                        .index = i,
+                        .node_type = nodeTypeOf(pointer.child, item),
+                        .id = typeId(pointer.child),
+                    });
+                    try collectFieldsAt(pointer.child, visitor, item);
+                    visitor.popField();
+                }
+            },
+            else => {},
+        },
+        .array => |array| {
+            for (value, 0..) |*item, i| {
+                try visitor.registerFieldStack(.{
+                    .index = i,
+                    .node_type = nodeTypeOf(array.child, item),
+                    .id = typeId(array.child),
+                });
+                try collectFieldsAt(array.child, visitor, item);
+                visitor.popField();
+            }
+        },
+        .optional => |optional| {
+            if (value.*) |*payload| {
+                try visitor.registerFieldStack(.{
+                    .index = 0,
+                    .node_type = nodeTypeOf(optional.child, payload),
+                    .id = typeId(optional.child),
+                });
+                try collectFieldsAt(optional.child, visitor, payload);
+                visitor.popField();
+            }
+        },
+        .@"struct" => |info| {
+            inline for (info.fields, 0..) |field, i| {
+                if (!field.is_comptime) {
+                    const field_value = &@field(value, field.name);
+                    try visitor.registerField(.{
+                        .index = i,
+                        .node_type = nodeTypeOf(field.type, field_value),
+                        .id = typeId(field.type),
+                    });
+                    try collectFieldsAt(field.type, visitor, field_value);
+                    visitor.popField();
+                }
+            }
+        },
+        .@"union" => |info| {
+            if (info.tag_type == null) return;
+            switch (value.*) {
+                inline else => |*payload, tag| {
+                    inline for (info.fields, 0..) |field, i| {
+                        if (comptime std.mem.eql(u8, field.name, @tagName(tag))) {
+                            if (field.type == void) return;
+                            try visitor.registerField(.{
+                                .index = i,
+                                .node_type = nodeTypeOf(field.type, payload),
+                                .id = typeId(field.type),
+                            });
+                            try collectFieldsAt(field.type, visitor, payload);
+                            visitor.popField();
+                            return;
+                        }
+                    }
+                    unreachable;
+                },
+            }
+        },
+        else => {},
+    }
+}
+
+fn mutateHere(comptime T: type, visitor: *Visitor, value: *T, mutation: Mutation) MutationError!void {
+    switch (mutation) {
+        .generate_replace => {
+            var replacement = try generateValue(T, visitor, 0, null);
+            errdefer deinitGenerated(T, visitor.allocator, &replacement);
+            replaceValue(T, visitor.allocator, value, replacement);
+        },
+        .recursive_replace => {
+            var replacement = try generateValue(T, visitor, visitor.generateDepth(), null);
+            errdefer deinitGenerated(T, visitor.allocator, &replacement);
+            replaceValue(T, visitor.allocator, value, replacement);
+        },
+        .splice => |data| {
+            var replacement = try deserializeAlloc(T, visitor.allocator, data);
+            errdefer deinitGenerated(T, visitor.allocator, &replacement);
+            replaceValue(T, visitor.allocator, value, replacement);
+        },
+        .generate_append, .splice_append, .iterable_pop => {
+            return mutateIterableHere(T, visitor, value, mutation);
+        },
+    }
+}
+
+fn mutateIterableHere(
+    comptime T: type,
+    visitor: *Visitor,
+    value: *T,
+    mutation: Mutation,
+) MutationError!void {
+    switch (@typeInfo(T)) {
+        .pointer => |pointer| {
+            if (pointer.size != .slice) return error.UnsupportedMutation;
+            switch (mutation) {
+                .generate_append => {
+                    var item = try generateValue(pointer.child, visitor, 0, null);
+                    errdefer deinitGenerated(pointer.child, visitor.allocator, &item);
+                    try appendSliceItem(T, pointer, visitor.allocator, value, item);
+                },
+                .splice_append => |data| {
+                    var item = try deserializeAlloc(pointer.child, visitor.allocator, data);
+                    errdefer deinitGenerated(pointer.child, visitor.allocator, &item);
+                    try appendSliceItem(T, pointer, visitor.allocator, value, item);
+                },
+                .iterable_pop => |index| try popSliceItem(T, pointer, visitor.allocator, value, index),
+                else => return error.UnsupportedMutation,
+            }
+        },
+        else => return error.UnsupportedMutation,
+    }
+}
+
+fn replaceValue(comptime T: type, allocator: std.mem.Allocator, value: *T, replacement: T) void {
+    deinitGenerated(T, allocator, value);
+    value.* = replacement;
+}
+
+fn appendSliceItem(
+    comptime T: type,
+    comptime pointer: std.builtin.Type.Pointer,
+    allocator: std.mem.Allocator,
+    value: *T,
+    item: pointer.child,
+) MutationError!void {
+    const old = value.*;
+    const replacement = try allocator.alloc(pointer.child, old.len + 1);
+    for (old, 0..) |old_item, i| {
+        replacement[i] = old_item;
+    }
+    replacement[old.len] = item;
+    allocator.free(old);
+    value.* = replacement;
+}
+
+fn popSliceItem(
+    comptime T: type,
+    comptime pointer: std.builtin.Type.Pointer,
+    allocator: std.mem.Allocator,
+    value: *T,
+    index: usize,
+) MutationError!void {
+    const old = value.*;
+    if (index >= old.len) return error.InvalidPath;
+    const replacement = try allocator.alloc(pointer.child, old.len - 1);
+    errdefer allocator.free(replacement);
+
+    var out: usize = 0;
+    for (old, 0..) |old_item, i| {
+        if (i == index) {
+            if (comptime needsGeneratedDeinit(pointer.child)) {
+                var removed = old_item;
+                deinitGenerated(pointer.child, allocator, &removed);
+            }
+            continue;
+        }
+        replacement[out] = old_item;
+        out += 1;
+    }
+    allocator.free(old);
+    value.* = replacement;
+}
+
+fn nodeTypeOf(comptime T: type, value: *const T) NodeType {
+    return switch (@typeInfo(T)) {
+        .pointer => |pointer| switch (pointer.size) {
+            .one => nodeTypeOf(pointer.child, value.*),
+            .slice => .{
+                .iterable = .{
+                    .fixed = false,
+                    .len = value.*.len,
+                    .inner_id = typeId(pointer.child),
+                },
+            },
+            else => .non_recursive,
+        },
+        .array => |array| .{
+            .iterable = .{
+                .fixed = true,
+                .len = array.len,
+                .inner_id = typeId(array.child),
+            },
+        },
+        .@"union" => |info| blk: {
+            if (info.tag_type == null) break :blk .non_recursive;
+            switch (value.*) {
+                inline else => |_, tag| {
+                    inline for (info.fields) |field| {
+                        if (comptime std.mem.eql(u8, field.name, @tagName(tag))) {
+                            if (containsType(field.type, T)) break :blk .recursive;
+                            break :blk .non_recursive;
+                        }
+                    }
+                    unreachable;
+                },
+            }
+        },
+        else => .non_recursive,
+    };
 }
 
 fn generateValue(
@@ -912,4 +1225,98 @@ test "maybeDeserializeAlloc rejects invalid or trailing bytes" {
         encoded_with_trailing.items,
     );
     try std.testing.expect(allocated_then_rejected == null);
+}
+
+test "collectFields records struct iterable paths" {
+    const Sample = struct {
+        amount: u16,
+        bytes: []u8,
+    };
+
+    var visitor = try Visitor.init(std.testing.allocator, 21, .{ .generate = 2, .iterate = 4 }, 0);
+    defer visitor.deinit();
+
+    var value = Sample{
+        .amount = 7,
+        .bytes = try std.testing.allocator.dupe(u8, "abc"),
+    };
+    defer deinitGenerated(Sample, std.testing.allocator, &value);
+
+    try collectFields(Sample, &visitor, &value);
+    var paths = visitor.takeFields();
+    defer deinitFieldPaths(std.testing.allocator, &paths);
+
+    try std.testing.expect(paths.items.len >= 2);
+    try std.testing.expectEqual(@as(usize, 0), paths.items[0].items[0].index);
+    try std.testing.expectEqual(@as(usize, 1), paths.items[1].items[0].index);
+    try std.testing.expect(paths.items[1].items[0].node_type.isIterable());
+    try std.testing.expectEqual(@as(usize, 3), paths.items[1].items[0].node_type.iterable.len);
+}
+
+test "mutateAtPath splices scalar and optional fields" {
+    const Sample = struct {
+        amount: u16,
+        maybe: ?u8,
+    };
+
+    var visitor = try Visitor.init(std.testing.allocator, 22, .{ .generate = 2, .iterate = 4 }, 0);
+    defer visitor.deinit();
+
+    var value = Sample{
+        .amount = 1,
+        .maybe = 2,
+    };
+    defer deinitGenerated(Sample, std.testing.allocator, &value);
+
+    const amount = try serializeAlloc(u16, std.testing.allocator, 0x1234);
+    defer std.testing.allocator.free(amount);
+    try mutateAtPath(Sample, &visitor, &value, &[_]usize{0}, .{ .splice = amount });
+    try std.testing.expectEqual(@as(u16, 0x1234), value.amount);
+
+    const maybe = try serializeAlloc(u8, std.testing.allocator, 9);
+    defer std.testing.allocator.free(maybe);
+    try mutateAtPath(Sample, &visitor, &value, &[_]usize{ 1, 0 }, .{ .splice = maybe });
+    try std.testing.expectEqual(@as(?u8, 9), value.maybe);
+}
+
+test "mutateAtPath appends and pops slice fields" {
+    const Sample = struct {
+        bytes: []u8,
+    };
+
+    var visitor = try Visitor.init(std.testing.allocator, 23, .{ .generate = 2, .iterate = 4 }, 0);
+    defer visitor.deinit();
+
+    var value = Sample{
+        .bytes = try std.testing.allocator.dupe(u8, "ab"),
+    };
+    defer deinitGenerated(Sample, std.testing.allocator, &value);
+
+    const item = try serializeAlloc(u8, std.testing.allocator, 'X');
+    defer std.testing.allocator.free(item);
+    try mutateAtPath(Sample, &visitor, &value, &[_]usize{0}, .{ .splice_append = item });
+    try std.testing.expectEqualSlices(u8, "abX", value.bytes);
+
+    try mutateAtPath(Sample, &visitor, &value, &[_]usize{0}, .{ .iterable_pop = 1 });
+    try std.testing.expectEqualSlices(u8, "aX", value.bytes);
+}
+
+test "mutateAtPath splices tagged union payload" {
+    const Expr = union(enum) {
+        literal: u16,
+        empty,
+    };
+
+    var visitor = try Visitor.init(std.testing.allocator, 24, .{ .generate = 2, .iterate = 4 }, 0);
+    defer visitor.deinit();
+
+    var value = Expr{ .literal = 1 };
+    defer deinitGenerated(Expr, std.testing.allocator, &value);
+
+    const replacement = try serializeAlloc(u16, std.testing.allocator, 0xbeef);
+    defer std.testing.allocator.free(replacement);
+    try mutateAtPath(Expr, &visitor, &value, &[_]usize{0}, .{ .splice = replacement });
+
+    try std.testing.expect(value == .literal);
+    try std.testing.expectEqual(@as(u16, 0xbeef), value.literal);
 }
