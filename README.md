@@ -5,7 +5,7 @@ Autarkie is a native grammar fuzzer. The existing implementation is Rust-based a
 
 ## Zig rewrite status
 
-A Zig rewrite has started at the repository root. It currently provides a tested core module in `src/root.zig` with visitor state, type ids, string pools, comptime generation for common Zig types, binary serialization/deserialization, field path collection, path-based mutation, and cmp match collection.
+A Zig rewrite has started at the repository root. It currently provides a tested core module in `src/root.zig` with visitor state, type ids, string pools, comptime generation for common Zig types, binary serialization/deserialization, field path collection, path-based mutation, cmp match collection, and a deterministic typed fuzzer loop.
 
 Run the Zig tests with:
 

@@ -90,6 +90,40 @@ pub const MutationError = error{
     UnsupportedMutation,
 };
 
+pub const FuzzResult = enum {
+    ok,
+    interesting,
+    crash,
+};
+
+pub const FuzzConfig = struct {
+    seed: u64 = 0,
+    depth: DepthInfo = .{
+        .generate = 2,
+        .iterate = 5,
+    },
+    string_count: usize = 50,
+    generated_inputs: usize = 100,
+    mutations_per_input: usize = 0,
+};
+
+pub const FuzzStats = struct {
+    executions: usize = 0,
+    generated: usize = 0,
+    mutations: usize = 0,
+    interesting: usize = 0,
+    crashes: usize = 0,
+
+    fn record(self: *FuzzStats, result: FuzzResult) void {
+        self.executions += 1;
+        switch (result) {
+            .ok => {},
+            .interesting => self.interesting += 1,
+            .crash => self.crashes += 1,
+        }
+    }
+};
+
 pub const Visitor = struct {
     allocator: std.mem.Allocator,
     depth: DepthInfo,
@@ -365,6 +399,54 @@ pub fn collectFields(comptime T: type, visitor: *Visitor, value: *const T) !void
 
 pub fn collectCmps(comptime T: type, visitor: *Visitor, value: *const T, cmp: Cmp) !void {
     try collectCmpMatchesAt(T, visitor, value, cmp);
+}
+
+pub fn runGenerated(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    config: FuzzConfig,
+    harness: anytype,
+) !FuzzStats {
+    var visitor = try Visitor.init(allocator, config.seed, config.depth, config.string_count);
+    defer visitor.deinit();
+
+    var stats = FuzzStats{};
+    for (0..config.generated_inputs) |_| {
+        var value = try generate(T, &visitor);
+        defer deinitGenerated(T, allocator, &value);
+
+        stats.generated += 1;
+        stats.record(harness(&value));
+    }
+
+    return stats;
+}
+
+pub fn runMutational(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    config: FuzzConfig,
+    harness: anytype,
+) !FuzzStats {
+    var visitor = try Visitor.init(allocator, config.seed, config.depth, config.string_count);
+    defer visitor.deinit();
+
+    var stats = FuzzStats{};
+    for (0..config.generated_inputs) |_| {
+        var value = try generate(T, &visitor);
+        defer deinitGenerated(T, allocator, &value);
+
+        stats.generated += 1;
+        stats.record(harness(&value));
+
+        for (0..config.mutations_per_input) |_| {
+            try mutateRandomPath(T, allocator, &visitor, &value);
+            stats.mutations += 1;
+            stats.record(harness(&value));
+        }
+    }
+
+    return stats;
 }
 
 pub fn mutateAtPath(
@@ -918,6 +1000,32 @@ fn mutateHere(comptime T: type, visitor: *Visitor, value: *T, mutation: Mutation
             return mutateIterableHere(T, visitor, value, mutation);
         },
     }
+}
+
+fn mutateRandomPath(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    visitor: *Visitor,
+    value: *T,
+) !void {
+    try collectFields(T, visitor, value);
+    var paths = visitor.takeFields();
+    defer deinitFieldPaths(allocator, &paths);
+
+    if (paths.items.len == 0) {
+        try mutateAtPath(T, visitor, value, &[_]usize{}, .generate_replace);
+        return;
+    }
+
+    const selected_index = visitor.randomRange(0, paths.items.len);
+    const selected = paths.items[selected_index].items;
+    var path: std.ArrayList(usize) = .empty;
+    defer path.deinit(allocator);
+    for (selected) |field| {
+        try path.append(allocator, field.index);
+    }
+
+    try mutateAtPath(T, visitor, value, path.items, .generate_replace);
 }
 
 fn mutateIterableHere(
@@ -1570,4 +1678,66 @@ test "collectCmps records nested slice element path" {
     };
     try mutateAtPath(Sample, &visitor, &value, &path, .{ .splice = matches.items[0].data });
     try std.testing.expectEqualSlices(u8, "aXc", value.bytes);
+}
+
+test "runGenerated executes typed harness for generated inputs" {
+    const Sample = struct {
+        amount: u8,
+    };
+    const Harness = struct {
+        fn run(value: *const Sample) FuzzResult {
+            _ = value;
+            return .interesting;
+        }
+    };
+
+    const stats = try runGenerated(
+        Sample,
+        std.testing.allocator,
+        .{
+            .seed = 41,
+            .depth = .{ .generate = 2, .iterate = 4 },
+            .string_count = 0,
+            .generated_inputs = 5,
+        },
+        Harness.run,
+    );
+
+    try std.testing.expectEqual(@as(usize, 5), stats.generated);
+    try std.testing.expectEqual(@as(usize, 0), stats.mutations);
+    try std.testing.expectEqual(@as(usize, 5), stats.executions);
+    try std.testing.expectEqual(@as(usize, 5), stats.interesting);
+    try std.testing.expectEqual(@as(usize, 0), stats.crashes);
+}
+
+test "runMutational executes generated and mutated inputs" {
+    const Sample = struct {
+        amount: u8,
+        bytes: []u8,
+    };
+    const Harness = struct {
+        fn run(value: *const Sample) FuzzResult {
+            if (value.bytes.len > 0 and value.amount == value.bytes[0]) {
+                return .interesting;
+            }
+            return .ok;
+        }
+    };
+
+    const stats = try runMutational(
+        Sample,
+        std.testing.allocator,
+        .{
+            .seed = 42,
+            .depth = .{ .generate = 2, .iterate = 4 },
+            .string_count = 0,
+            .generated_inputs = 3,
+            .mutations_per_input = 2,
+        },
+        Harness.run,
+    );
+
+    try std.testing.expectEqual(@as(usize, 3), stats.generated);
+    try std.testing.expectEqual(@as(usize, 6), stats.mutations);
+    try std.testing.expectEqual(@as(usize, 9), stats.executions);
 }
