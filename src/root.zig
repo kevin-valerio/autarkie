@@ -48,6 +48,16 @@ pub const FieldLocation = struct {
     id: Id,
 };
 
+pub const Cmp = struct {
+    left: u64,
+    right: u64,
+};
+
+pub const CmpMatch = struct {
+    path: std.ArrayList(FieldLocation),
+    data: []u8,
+};
+
 pub const GenerateError = error{
     OutOfMemory,
     RecursionLimit,
@@ -87,6 +97,7 @@ pub const Visitor = struct {
     strings: std.ArrayList([]u8),
     serialized_items: std.ArrayList(Serialized),
     fields_items: std.ArrayList(std.ArrayList(FieldLocation)),
+    matching_cmps: std.ArrayList(CmpMatch),
     field_stack: std.ArrayList(FieldLocation),
 
     pub fn init(
@@ -102,6 +113,7 @@ pub const Visitor = struct {
             .strings = .empty,
             .serialized_items = .empty,
             .fields_items = .empty,
+            .matching_cmps = .empty,
             .field_stack = .empty,
         };
         errdefer visitor.deinit();
@@ -125,6 +137,12 @@ pub const Visitor = struct {
             field_path.deinit(self.allocator);
         }
         self.fields_items.deinit(self.allocator);
+
+        for (self.matching_cmps.items) |*match| {
+            match.path.deinit(self.allocator);
+            self.allocator.free(match.data);
+        }
+        self.matching_cmps.deinit(self.allocator);
         self.field_stack.deinit(self.allocator);
     }
 
@@ -188,6 +206,33 @@ pub const Visitor = struct {
         return items;
     }
 
+    pub fn registerCmp(self: *Visitor, data: []const u8) !void {
+        var path: std.ArrayList(FieldLocation) = .empty;
+        errdefer path.deinit(self.allocator);
+        try path.appendSlice(self.allocator, self.field_stack.items);
+
+        const owned_data = try self.allocator.dupe(u8, data);
+        errdefer self.allocator.free(owned_data);
+
+        try self.matching_cmps.append(self.allocator, .{
+            .path = path,
+            .data = owned_data,
+        });
+    }
+
+    pub fn takeCmps(self: *Visitor) std.ArrayList(CmpMatch) {
+        const matches = self.matching_cmps;
+        self.matching_cmps = .empty;
+
+        for (self.fields_items.items) |*field_path| {
+            field_path.deinit(self.allocator);
+        }
+        self.fields_items.clearRetainingCapacity();
+        self.field_stack.clearRetainingCapacity();
+
+        return matches;
+    }
+
     pub fn registerField(self: *Visitor, item: FieldLocation) !void {
         try self.field_stack.append(self.allocator, item);
         var path: std.ArrayList(FieldLocation) = .empty;
@@ -243,6 +288,14 @@ pub fn deinitFieldPaths(
         path.deinit(allocator);
     }
     paths.deinit(allocator);
+}
+
+pub fn deinitCmpMatches(allocator: std.mem.Allocator, matches: *std.ArrayList(CmpMatch)) void {
+    for (matches.items) |*match| {
+        match.path.deinit(allocator);
+        allocator.free(match.data);
+    }
+    matches.deinit(allocator);
 }
 
 pub fn typeId(comptime T: type) Id {
@@ -308,6 +361,10 @@ pub fn maybeDeserializeAlloc(
 
 pub fn collectFields(comptime T: type, visitor: *Visitor, value: *const T) !void {
     try collectFieldsAt(T, visitor, value);
+}
+
+pub fn collectCmps(comptime T: type, visitor: *Visitor, value: *const T, cmp: Cmp) !void {
+    try collectCmpMatchesAt(T, visitor, value, cmp);
 }
 
 pub fn mutateAtPath(
@@ -761,6 +818,85 @@ fn collectFieldsAt(comptime T: type, visitor: *Visitor, value: *const T) !void {
     }
 }
 
+fn collectCmpMatchesAt(comptime T: type, visitor: *Visitor, value: *const T, cmp: Cmp) !void {
+    switch (@typeInfo(T)) {
+        .int, .float => try collectScalarCmp(T, visitor, value.*, cmp),
+        .pointer => |pointer| switch (pointer.size) {
+            .one => try collectCmpMatchesAt(pointer.child, visitor, value.*, cmp),
+            .slice => {
+                for (value.*, 0..) |*item, i| {
+                    try visitor.registerFieldStack(.{
+                        .index = i,
+                        .node_type = nodeTypeOf(pointer.child, item),
+                        .id = typeId(pointer.child),
+                    });
+                    try collectCmpMatchesAt(pointer.child, visitor, item, cmp);
+                    visitor.popField();
+                }
+            },
+            else => {},
+        },
+        .array => |array| {
+            for (value, 0..) |*item, i| {
+                try visitor.registerFieldStack(.{
+                    .index = i,
+                    .node_type = nodeTypeOf(array.child, item),
+                    .id = typeId(array.child),
+                });
+                try collectCmpMatchesAt(array.child, visitor, item, cmp);
+                visitor.popField();
+            }
+        },
+        .optional => |optional| {
+            if (value.*) |*payload| {
+                try visitor.registerFieldStack(.{
+                    .index = 0,
+                    .node_type = nodeTypeOf(optional.child, payload),
+                    .id = typeId(optional.child),
+                });
+                try collectCmpMatchesAt(optional.child, visitor, payload, cmp);
+                visitor.popField();
+            }
+        },
+        .@"struct" => |info| {
+            inline for (info.fields, 0..) |field, i| {
+                if (!field.is_comptime) {
+                    const field_value = &@field(value, field.name);
+                    try visitor.registerFieldStack(.{
+                        .index = i,
+                        .node_type = nodeTypeOf(field.type, field_value),
+                        .id = typeId(field.type),
+                    });
+                    try collectCmpMatchesAt(field.type, visitor, field_value, cmp);
+                    visitor.popField();
+                }
+            }
+        },
+        .@"union" => |info| {
+            if (info.tag_type == null) return;
+            switch (value.*) {
+                inline else => |*payload, tag| {
+                    inline for (info.fields, 0..) |field, i| {
+                        if (comptime std.mem.eql(u8, field.name, @tagName(tag))) {
+                            if (field.type == void) return;
+                            try visitor.registerFieldStack(.{
+                                .index = i,
+                                .node_type = nodeTypeOf(field.type, payload),
+                                .id = typeId(field.type),
+                            });
+                            try collectCmpMatchesAt(field.type, visitor, payload, cmp);
+                            visitor.popField();
+                            return;
+                        }
+                    }
+                    unreachable;
+                },
+            }
+        },
+        else => {},
+    }
+}
+
 fn mutateHere(comptime T: type, visitor: *Visitor, value: *T, mutation: Mutation) MutationError!void {
     switch (mutation) {
         .generate_replace => {
@@ -897,6 +1033,59 @@ fn nodeTypeOf(comptime T: type, value: *const T) NodeType {
             }
         },
         else => .non_recursive,
+    };
+}
+
+fn collectScalarCmp(comptime T: type, visitor: *Visitor, value: T, cmp: Cmp) !void {
+    const value_as_u64 = valueAsCmpU64(T, value) orelse return;
+    if (value_as_u64 == cmp.left) {
+        try registerCmpReplacement(T, visitor, cmp.right);
+    } else if (value_as_u64 == cmp.right) {
+        try registerCmpReplacement(T, visitor, cmp.left);
+    }
+}
+
+fn registerCmpReplacement(comptime T: type, visitor: *Visitor, raw: u64) !void {
+    const replacement = cmpU64AsValue(T, raw);
+    const data = try serializeAlloc(T, visitor.allocator, replacement);
+    defer visitor.allocator.free(data);
+    try visitor.registerCmp(data);
+}
+
+fn valueAsCmpU64(comptime T: type, value: T) ?u64 {
+    return switch (@typeInfo(T)) {
+        .int => |int| switch (int.signedness) {
+            .unsigned => @truncate(value),
+            .signed => signedAsCmpU64(T, int.bits, value),
+        },
+        .float => {
+            if (!std.math.isFinite(value) or value < 0 or value > std.math.maxInt(u64)) return null;
+            return @intFromFloat(value);
+        },
+        else => null,
+    };
+}
+
+fn signedAsCmpU64(comptime T: type, comptime bits: u16, value: T) u64 {
+    if (bits < 64) {
+        return @bitCast(@as(i64, value));
+    }
+    const U = std.meta.Int(.unsigned, bits);
+    return @truncate(@as(U, @bitCast(value)));
+}
+
+fn cmpU64AsValue(comptime T: type, raw: u64) T {
+    return switch (@typeInfo(T)) {
+        .int => |int| {
+            const U = std.meta.Int(.unsigned, int.bits);
+            const truncated: U = @truncate(raw);
+            return switch (int.signedness) {
+                .unsigned => truncated,
+                .signed => @bitCast(truncated),
+            };
+        },
+        .float => @floatFromInt(raw),
+        else => unreachable,
     };
 }
 
@@ -1319,4 +1508,66 @@ test "mutateAtPath splices tagged union payload" {
 
     try std.testing.expect(value == .literal);
     try std.testing.expectEqual(@as(u16, 0xbeef), value.literal);
+}
+
+test "collectCmps records scalar match replacement bytes" {
+    const Sample = struct {
+        amount: u16,
+        other: u16,
+    };
+
+    var visitor = try Visitor.init(std.testing.allocator, 31, .{ .generate = 2, .iterate = 4 }, 0);
+    defer visitor.deinit();
+
+    var value = Sample{
+        .amount = 0x1234,
+        .other = 7,
+    };
+    defer deinitGenerated(Sample, std.testing.allocator, &value);
+
+    try collectCmps(Sample, &visitor, &value, .{ .left = 0x1234, .right = 0xbeef });
+    var matches = visitor.takeCmps();
+    defer deinitCmpMatches(std.testing.allocator, &matches);
+
+    try std.testing.expectEqual(@as(usize, 1), matches.items.len);
+    try std.testing.expectEqual(@as(usize, 1), matches.items[0].path.items.len);
+    try std.testing.expectEqual(@as(usize, 0), matches.items[0].path.items[0].index);
+
+    const replacement = try deserializeAlloc(u16, std.testing.allocator, matches.items[0].data);
+    try std.testing.expectEqual(@as(u16, 0xbeef), replacement);
+
+    try mutateAtPath(Sample, &visitor, &value, &[_]usize{matches.items[0].path.items[0].index}, .{
+        .splice = matches.items[0].data,
+    });
+    try std.testing.expectEqual(@as(u16, 0xbeef), value.amount);
+}
+
+test "collectCmps records nested slice element path" {
+    const Sample = struct {
+        bytes: []u8,
+    };
+
+    var visitor = try Visitor.init(std.testing.allocator, 32, .{ .generate = 2, .iterate = 4 }, 0);
+    defer visitor.deinit();
+
+    var value = Sample{
+        .bytes = try std.testing.allocator.dupe(u8, "abc"),
+    };
+    defer deinitGenerated(Sample, std.testing.allocator, &value);
+
+    try collectCmps(Sample, &visitor, &value, .{ .left = 'b', .right = 'X' });
+    var matches = visitor.takeCmps();
+    defer deinitCmpMatches(std.testing.allocator, &matches);
+
+    try std.testing.expectEqual(@as(usize, 1), matches.items.len);
+    try std.testing.expectEqual(@as(usize, 2), matches.items[0].path.items.len);
+    try std.testing.expectEqual(@as(usize, 0), matches.items[0].path.items[0].index);
+    try std.testing.expectEqual(@as(usize, 1), matches.items[0].path.items[1].index);
+
+    const path = [_]usize{
+        matches.items[0].path.items[0].index,
+        matches.items[0].path.items[1].index,
+    };
+    try mutateAtPath(Sample, &visitor, &value, &path, .{ .splice = matches.items[0].data });
+    try std.testing.expectEqualSlices(u8, "aXc", value.bytes);
 }
