@@ -53,6 +53,13 @@ pub const GenerateError = error{
     RecursionLimit,
 };
 
+pub const CodecError = error{
+    OutOfMemory,
+    UnexpectedEnd,
+    InvalidTag,
+    TrailingBytes,
+};
+
 pub const Visitor = struct {
     allocator: std.mem.Allocator,
     depth: DepthInfo,
@@ -224,6 +231,51 @@ pub fn generateWithSettings(
     return generateValue(T, visitor, 0, settings);
 }
 
+pub fn serializeAlloc(comptime T: type, allocator: std.mem.Allocator, value: T) CodecError![]u8 {
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(allocator);
+
+    try appendEncoded(T, allocator, &bytes, value);
+    return bytes.toOwnedSlice(allocator);
+}
+
+pub fn deserializeAlloc(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    data: []const u8,
+) CodecError!T {
+    var decoder = Decoder{
+        .allocator = allocator,
+        .data = data,
+    };
+    var value = try decoder.readValue(T);
+    errdefer deinitGenerated(T, allocator, &value);
+
+    if (!decoder.finished()) return error.TrailingBytes;
+    return value;
+}
+
+pub fn maybeDeserializeAlloc(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    data: []const u8,
+) CodecError!?T {
+    var decoder = Decoder{
+        .allocator = allocator,
+        .data = data,
+    };
+    var value = decoder.readValue(T) catch |err| switch (err) {
+        error.UnexpectedEnd, error.InvalidTag, error.TrailingBytes => return null,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+
+    if (!decoder.finished()) {
+        deinitGenerated(T, allocator, &value);
+        return null;
+    }
+    return value;
+}
+
 pub fn deinitGenerated(comptime T: type, allocator: std.mem.Allocator, value: *T) void {
     switch (@typeInfo(T)) {
         .pointer => |pointer| switch (pointer.size) {
@@ -232,7 +284,7 @@ pub fn deinitGenerated(comptime T: type, allocator: std.mem.Allocator, value: *T
                 allocator.destroy(value.*);
             },
             .slice => {
-                if (needsGeneratedDeinit(pointer.child)) {
+                if (comptime needsGeneratedDeinit(pointer.child)) {
                     for (value.*) |*item| {
                         deinitGenerated(pointer.child, allocator, item);
                     }
@@ -242,7 +294,7 @@ pub fn deinitGenerated(comptime T: type, allocator: std.mem.Allocator, value: *T
             else => {},
         },
         .array => |array| {
-            if (needsGeneratedDeinit(array.child)) {
+            if (comptime needsGeneratedDeinit(array.child)) {
                 for (value) |*item| {
                     deinitGenerated(array.child, allocator, item);
                 }
@@ -250,7 +302,7 @@ pub fn deinitGenerated(comptime T: type, allocator: std.mem.Allocator, value: *T
         },
         .@"struct" => |info| {
             inline for (info.fields) |field| {
-                if (!field.is_comptime and needsGeneratedDeinit(field.type)) {
+                if (!field.is_comptime and comptime needsGeneratedDeinit(field.type)) {
                     deinitGenerated(field.type, allocator, &@field(value, field.name));
                 }
             }
@@ -268,6 +320,270 @@ pub fn deinitGenerated(comptime T: type, allocator: std.mem.Allocator, value: *T
             }
         },
         else => {},
+    }
+}
+
+const Decoder = struct {
+    allocator: std.mem.Allocator,
+    data: []const u8,
+    index: usize = 0,
+
+    fn finished(self: *const Decoder) bool {
+        return self.index == self.data.len;
+    }
+
+    fn readBytes(self: *Decoder, len: usize) CodecError![]const u8 {
+        if (self.index + len > self.data.len) return error.UnexpectedEnd;
+        const bytes = self.data[self.index..][0..len];
+        self.index += len;
+        return bytes;
+    }
+
+    fn readValue(self: *Decoder, comptime T: type) CodecError!T {
+        switch (@typeInfo(T)) {
+            .void => return {},
+            .bool => {
+                const byte = (try self.readBytes(1))[0];
+                return switch (byte) {
+                    0 => false,
+                    1 => true,
+                    else => error.InvalidTag,
+                };
+            },
+            .int => return try self.readInt(T),
+            .float => {
+                const U = std.meta.Int(.unsigned, @bitSizeOf(T));
+                return @bitCast(try self.readInt(U));
+            },
+            .array => |array| {
+                var result: T = undefined;
+                var decoded: usize = 0;
+                errdefer {
+                    if (comptime needsGeneratedDeinit(array.child)) {
+                        for (result[0..decoded]) |*item| {
+                            deinitGenerated(array.child, self.allocator, item);
+                        }
+                    }
+                }
+
+                for (&result) |*item| {
+                    item.* = try self.readValue(array.child);
+                    decoded += 1;
+                }
+                return result;
+            },
+            .pointer => |pointer| return try self.readPointer(T, pointer),
+            .optional => |optional| {
+                const tag = (try self.readBytes(1))[0];
+                return switch (tag) {
+                    0 => null,
+                    1 => try self.readValue(optional.child),
+                    else => error.InvalidTag,
+                };
+            },
+            .@"enum" => |info| {
+                const raw = try self.readInt(info.tag_type);
+                inline for (info.fields) |field| {
+                    if (field.value == raw) return @enumFromInt(raw);
+                }
+                return error.InvalidTag;
+            },
+            .@"struct" => |info| {
+                var result: T = undefined;
+                var decoded: usize = 0;
+                errdefer {
+                    inline for (info.fields, 0..) |field, i| {
+                        if (i < decoded and !field.is_comptime and comptime needsGeneratedDeinit(field.type)) {
+                            deinitGenerated(field.type, self.allocator, &@field(result, field.name));
+                        }
+                    }
+                }
+
+                inline for (info.fields) |field| {
+                    if (!field.is_comptime) {
+                        @field(result, field.name) = try self.readValue(field.type);
+                        decoded += 1;
+                    }
+                }
+                return result;
+            },
+            .@"union" => |info| return try self.readUnion(T, info),
+            else => @compileError("autarkie cannot deserialize values for " ++ @typeName(T)),
+        }
+    }
+
+    fn readInt(self: *Decoder, comptime T: type) CodecError!T {
+        comptime {
+            const bits = @typeInfo(T).int.bits;
+            if (bits % 8 != 0) {
+                @compileError("autarkie serialization requires byte-aligned integers");
+            }
+        }
+
+        const byte_count = @divExact(@typeInfo(T).int.bits, 8);
+        const bytes = try self.readBytes(byte_count);
+        return std.mem.readInt(T, bytes[0..byte_count], .little);
+    }
+
+    fn readPointer(
+        self: *Decoder,
+        comptime T: type,
+        comptime pointer: std.builtin.Type.Pointer,
+    ) CodecError!T {
+        switch (pointer.size) {
+            .one => {
+                const value = try self.allocator.create(pointer.child);
+                errdefer self.allocator.destroy(value);
+                value.* = try self.readValue(pointer.child);
+                return value;
+            },
+            .slice => {
+                const len = try self.readInt(u64);
+                if (len > std.math.maxInt(usize)) return error.InvalidTag;
+                const slice = try self.allocator.alloc(pointer.child, @intCast(len));
+                var decoded: usize = 0;
+                errdefer {
+                    if (comptime needsGeneratedDeinit(pointer.child)) {
+                        for (slice[0..decoded]) |*item| {
+                            deinitGenerated(pointer.child, self.allocator, item);
+                        }
+                    }
+                    self.allocator.free(slice);
+                }
+
+                for (slice) |*item| {
+                    item.* = try self.readValue(pointer.child);
+                    decoded += 1;
+                }
+                return slice;
+            },
+            else => @compileError("autarkie only deserializes single-item pointers and slices"),
+        }
+    }
+
+    fn readUnion(
+        self: *Decoder,
+        comptime T: type,
+        comptime info: std.builtin.Type.Union,
+    ) CodecError!T {
+        if (info.tag_type == null) {
+            @compileError("autarkie only deserializes tagged unions");
+        }
+
+        const tag = try self.readInt(u32);
+        inline for (info.fields, 0..) |field, i| {
+            if (tag == i) {
+                if (field.type == void) return @unionInit(T, field.name, {});
+                return @unionInit(T, field.name, try self.readValue(field.type));
+            }
+        }
+        return error.InvalidTag;
+    }
+};
+
+fn appendEncoded(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    bytes: *std.ArrayList(u8),
+    value: T,
+) CodecError!void {
+    switch (@typeInfo(T)) {
+        .void => return,
+        .bool => try bytes.append(allocator, @intFromBool(value)),
+        .int => try appendInt(T, allocator, bytes, value),
+        .float => {
+            const U = std.meta.Int(.unsigned, @bitSizeOf(T));
+            try appendInt(U, allocator, bytes, @bitCast(value));
+        },
+        .array => |array| {
+            for (value) |item| {
+                try appendEncoded(array.child, allocator, bytes, item);
+            }
+        },
+        .pointer => |pointer| try appendPointer(T, pointer, allocator, bytes, value),
+        .optional => |optional| {
+            if (value) |payload| {
+                try bytes.append(allocator, 1);
+                try appendEncoded(optional.child, allocator, bytes, payload);
+            } else {
+                try bytes.append(allocator, 0);
+            }
+        },
+        .@"enum" => |info| {
+            try appendInt(info.tag_type, allocator, bytes, @intFromEnum(value));
+        },
+        .@"struct" => |info| {
+            inline for (info.fields) |field| {
+                if (!field.is_comptime) {
+                    try appendEncoded(field.type, allocator, bytes, @field(value, field.name));
+                }
+            }
+        },
+        .@"union" => |info| try appendUnion(T, info, allocator, bytes, value),
+        else => @compileError("autarkie cannot serialize values for " ++ @typeName(T)),
+    }
+}
+
+fn appendInt(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    bytes: *std.ArrayList(u8),
+    value: T,
+) CodecError!void {
+    comptime {
+        const bits = @typeInfo(T).int.bits;
+        if (bits % 8 != 0) {
+            @compileError("autarkie serialization requires byte-aligned integers");
+        }
+    }
+
+    const byte_count = @divExact(@typeInfo(T).int.bits, 8);
+    var buffer: [byte_count]u8 = undefined;
+    std.mem.writeInt(T, &buffer, value, .little);
+    try bytes.appendSlice(allocator, &buffer);
+}
+
+fn appendPointer(
+    comptime T: type,
+    comptime pointer: std.builtin.Type.Pointer,
+    allocator: std.mem.Allocator,
+    bytes: *std.ArrayList(u8),
+    value: T,
+) CodecError!void {
+    switch (pointer.size) {
+        .one => try appendEncoded(pointer.child, allocator, bytes, value.*),
+        .slice => {
+            try appendInt(u64, allocator, bytes, value.len);
+            for (value) |item| {
+                try appendEncoded(pointer.child, allocator, bytes, item);
+            }
+        },
+        else => @compileError("autarkie only serializes single-item pointers and slices"),
+    }
+}
+
+fn appendUnion(
+    comptime T: type,
+    comptime info: std.builtin.Type.Union,
+    allocator: std.mem.Allocator,
+    bytes: *std.ArrayList(u8),
+    value: T,
+) CodecError!void {
+    if (info.tag_type == null) {
+        @compileError("autarkie only serializes tagged unions");
+    }
+
+    switch (value) {
+        inline else => |payload, tag| {
+            inline for (info.fields, 0..) |field, i| {
+                if (comptime std.mem.eql(u8, field.name, @tagName(tag))) {
+                    try appendInt(u32, allocator, bytes, @intCast(i));
+                    try appendEncoded(field.type, allocator, bytes, payload);
+                    return;
+                }
+            }
+            unreachable;
+        },
     }
 }
 
@@ -511,4 +827,89 @@ test "generate tagged unions and avoid recursive variants at depth limit" {
     defer deinitGenerated(Expr, std.testing.allocator, &value);
 
     try std.testing.expect(value == .literal);
+}
+
+test "serialize and deserialize struct with slice and optional fields" {
+    const Sample = struct {
+        enabled: bool,
+        amount: u16,
+        bytes: []const u8,
+        maybe: ?u32,
+        fixed: [3]u8,
+    };
+
+    const original = Sample{
+        .enabled = true,
+        .amount = 0x1234,
+        .bytes = "abc",
+        .maybe = 0xfeed_beef,
+        .fixed = .{ 1, 2, 3 },
+    };
+
+    const encoded = try serializeAlloc(Sample, std.testing.allocator, original);
+    defer std.testing.allocator.free(encoded);
+
+    var decoded = try deserializeAlloc(Sample, std.testing.allocator, encoded);
+    defer deinitGenerated(Sample, std.testing.allocator, &decoded);
+
+    try std.testing.expect(decoded.enabled);
+    try std.testing.expectEqual(@as(u16, 0x1234), decoded.amount);
+    try std.testing.expectEqualSlices(u8, "abc", decoded.bytes);
+    try std.testing.expectEqual(@as(?u32, 0xfeed_beef), decoded.maybe);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3 }, &decoded.fixed);
+}
+
+test "serialize and deserialize enums and tagged unions" {
+    const Flavor = enum(u8) {
+        vanilla = 1,
+        chocolate = 7,
+    };
+    const Expr = union(enum) {
+        literal: u16,
+        flavor: Flavor,
+        empty,
+    };
+
+    const encoded_enum = try serializeAlloc(Flavor, std.testing.allocator, .chocolate);
+    defer std.testing.allocator.free(encoded_enum);
+    const decoded_enum = try deserializeAlloc(Flavor, std.testing.allocator, encoded_enum);
+    try std.testing.expectEqual(Flavor.chocolate, decoded_enum);
+
+    const encoded_union = try serializeAlloc(Expr, std.testing.allocator, .{ .literal = 0xabcd });
+    defer std.testing.allocator.free(encoded_union);
+    var decoded_union = try deserializeAlloc(Expr, std.testing.allocator, encoded_union);
+    defer deinitGenerated(Expr, std.testing.allocator, &decoded_union);
+
+    try std.testing.expect(decoded_union == .literal);
+    try std.testing.expectEqual(@as(u16, 0xabcd), decoded_union.literal);
+}
+
+test "maybeDeserializeAlloc rejects invalid or trailing bytes" {
+    const Sample = struct {
+        value: u16,
+    };
+    const WithSlice = struct {
+        bytes: []u8,
+    };
+
+    const short = try maybeDeserializeAlloc(Sample, std.testing.allocator, &[_]u8{0x01});
+    try std.testing.expect(short == null);
+
+    const trailing = try maybeDeserializeAlloc(Sample, std.testing.allocator, &[_]u8{ 0x01, 0x00, 0xff });
+    try std.testing.expect(trailing == null);
+
+    const encoded = try serializeAlloc(WithSlice, std.testing.allocator, .{ .bytes = @constCast("abc") });
+    defer std.testing.allocator.free(encoded);
+
+    var encoded_with_trailing = try std.ArrayList(u8).initCapacity(std.testing.allocator, encoded.len + 1);
+    defer encoded_with_trailing.deinit(std.testing.allocator);
+    try encoded_with_trailing.appendSlice(std.testing.allocator, encoded);
+    try encoded_with_trailing.append(std.testing.allocator, 0xff);
+
+    const allocated_then_rejected = try maybeDeserializeAlloc(
+        WithSlice,
+        std.testing.allocator,
+        encoded_with_trailing.items,
+    );
+    try std.testing.expect(allocated_then_rejected == null);
 }
