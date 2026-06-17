@@ -1,7 +1,20 @@
-# Autarkie - Instant Grammar Fuzzing Using Rust Macros
+# Autarkie - Instant Grammar Fuzzing
  <img align="right" src="image.jpeg" alt="LibAFL logo" width="250" heigh="250">
 
-Autarkie is a native grammar fuzzer built in Rust. Using procedural macros, it (almost completely) automatically creates a grammar fuzzer. 
+Autarkie is a native grammar fuzzer. The existing implementation is Rust-based and uses procedural macros to almost automatically create a grammar fuzzer.
+
+## Zig rewrite status
+
+A Zig rewrite has started at the repository root. It currently provides a tested core generation module in `src/root.zig` with visitor state, type ids, string pools, and comptime generation for common Zig types.
+
+Run the Zig tests with:
+
+```sh
+zig build test
+```
+
+The AFL++/libFuzzer runtime integration and full Rust macro parity are not ported yet.
+
 Autarkie is heavily inspired by [nautilus](https://github.com/nautilus-fuzz/nautilus).
 
 # Features

@@ -1,0 +1,14 @@
+.{
+    .name = .autarkie,
+    .version = "0.8.0",
+    .fingerprint = 0xff819805f5832481,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+        "LICENSE",
+    },
+}

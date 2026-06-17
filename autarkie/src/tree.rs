@@ -778,6 +778,7 @@ impl Node for std::string::String {
     }
 }
 
+#[cfg(not(feature = "scale"))]
 impl Node for Box<str> {
     fn __autarkie_generate(
         visitor: &mut Visitor,

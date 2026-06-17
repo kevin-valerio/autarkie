@@ -1,4 +1,7 @@
 /target
+/.serena
+/.zig-cache
+/zig-out
 *.pdf
 *.aux
 *.run.xml
