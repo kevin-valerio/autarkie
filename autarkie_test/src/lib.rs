@@ -117,18 +117,20 @@ mod tests {
                 generate: 2,
                 iterate: 2,
             },
+            0,
         );
         Statement::__autarkie_register(&mut visitor, None, 0);
+        let recursive: BTreeMap<String, BTreeSet<usize>> = visitor
+            .calculate_recursion()
+            .into_iter()
+            .map(|(id, variants)| (visitor.ty_name_map().get(&id).unwrap().clone(), variants))
+            .collect();
         assert_eq!(
-            visitor.calculate_recursion(),
+            recursive,
             BTreeMap::from_iter([
                 (
                     "autarkie_test::Expr".to_string(),
                     BTreeSet::from_iter([2, 3, 4, 5, 6, 7, 8, 9])
-                ),
-                (
-                    "core::option::Option<autarkie_test::Expr>".to_string(),
-                    BTreeSet::from_iter([1])
                 ),
                 (
                     "core::result::Result<autarkie_test::InnerBoxed, usize>".to_string(),
